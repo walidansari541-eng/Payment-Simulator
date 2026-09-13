@@ -1,0 +1,107 @@
+# All application services run the same image with a different entrypoint. Split
+# into separate containers so a single service can be killed mid-saga and the
+# workflow's recovery behaviour observed — that is the whole point of Week 8.
+
+x-app: &app
+  build: .
+  env_file: [.env]
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+    rabbitmq:
+      condition: service_healthy
+
+services:
+  api:
+    <<: *app
+    container_name: payment_api
+    command: ["node", "src/services/api.js"]
+    environment:
+      SERVICE_NAME: api
+    ports:
+      - "3000:3000"
+
+  orchestrator:
+    <<: *app
+    container_name: payment_orchestrator
+    command: ["node", "src/services/orchestrator.js"]
+    environment:
+      SERVICE_NAME: orchestrator
+    ports:
+      - "9101:9100"   # /metrics and /health
+
+  inventory-service:
+    <<: *app
+    container_name: inventory_service
+    command: ["node", "src/services/inventoryService.js"]
+    environment:
+      SERVICE_NAME: inventory-service
+      # Flip to "true" (and recreate the container) to force every compensation
+      # to fail — see scripts/08-compensation-fails.sh
+      INVENTORY_FAIL_RELEASE: "${INVENTORY_FAIL_RELEASE:-false}"
+    ports:
+      - "9102:9100"   # /metrics and /health
+
+  payment-worker:
+    <<: *app
+    container_name: payment_worker
+    command: ["node", "src/services/paymentWorker.js"]
+    environment:
+      SERVICE_NAME: payment-worker
+    ports:
+      - "9103:9100"   # /metrics and /health
+
+  notification-service:
+    <<: *app
+    container_name: notification_service
+    command: ["node", "src/services/notificationService.js"]
+    environment:
+      SERVICE_NAME: notification-service
+    ports:
+      - "9104:9100"   # /metrics and /health
+
+  mock-provider:
+    <<: *app
+    container_name: mock_provider
+    command: ["node", "src/services/mockProvider.js"]
+    environment:
+      SERVICE_NAME: mock-provider
+    ports:
+      - "4000:4000"
+  postgres:
+    image: postgres:17-alpine
+    container_name: postgres_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: payment
+    ports:
+      - "${PG_HOST_PORT:-5442}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Only executed when the volume is empty: `docker compose down -v` to reapply.
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d payment"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: payment_queue
+    ports:
+      # Host ports are offset so this stack can run alongside another local
+      # RabbitMQ. Inside the compose network everything still uses 5672.
+      - "${RABBIT_HOST_PORT:-5673}:5672"    # AMQP
+      - "${RABBIT_UI_PORT:-15673}:15672"    # Management UI (guest/guest)
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  postgres_data:

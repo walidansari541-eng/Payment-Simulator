@@ -1,0 +1,30 @@
+{
+  "name": "payment-system",
+  "version": "2.0.0",
+  "description": "Saga-orchestrated payment processing system: outbox, inbox, compensation, reconciliation",
+  "main": "server.js",
+  "scripts": {
+    "start": "node src/services/api.js",
+    "start:api": "node src/services/api.js",
+    "start:orchestrator": "node src/services/orchestrator.js",
+    "start:inventory": "node src/services/inventoryService.js",
+    "start:payment-worker": "node src/services/paymentWorker.js",
+    "start:notification": "node src/services/notificationService.js",
+    "start:provider": "node src/services/mockProvider.js",
+    "test": "./scripts/run-all.sh"
+  },
+  "keywords": [
+    "saga",
+    "outbox",
+    "idempotency",
+    "distributed-transactions"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "amqplib": "^2.0.1",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "pg": "^8.23.0"
+  }
+}
