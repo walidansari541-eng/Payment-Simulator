@@ -1,313 +1,199 @@
-# Notes App
+# Payment Processing System — Saga Orchestration
 
-A multi-user notes REST API built on Express 5. Each user registers, logs in for a session token, and manages their own private notes. The service demonstrates a full production-shaped stack: PostgreSQL for persistence, Redis for session storage and read-through caching, RabbitMQ for asynchronous notification delivery with retries and a dead-letter queue, and Nginx as a reverse proxy.
+A distributed payment system built to make the hard parts of distributed transactions **visible and testable**: Saga orchestration, compensation, the transactional Outbox, idempotent consumers, bounded retries, unknown provider outcomes, and reconciliation.
 
-The whole stack runs from a single `docker compose up` on any machine with Docker installed.
+This is not a payment integration. It is a **simulator**. Six services coordinate a checkout across independent failure domains, and every failure mode you would otherwise spend a year meeting in production can be triggered on demand with one command..
+
+---
 
 ## Tech Stack
 
-| Layer            | Technology                          |
-|------------------|-------------------------------------|
-| Runtime          | Node.js 18 (Alpine, in Docker)      |
-| Framework        | Express 5.x                         |
-| Database         | PostgreSQL 15 (`pg` 8.x driver)     |
-| Cache / Sessions | Redis 7 (`redis` 5.x client)        |
-| Message Broker   | RabbitMQ 3 (`amqplib`)              |
-| Reverse Proxy    | Nginx (alpine)                      |
-| Password Hashing | bcrypt                              |
-| Config           | dotenv                              |
+| Layer | Technology |
+|---|---|
+| Runtime | Node.js 22 (Alpine) |
+| HTTP | Express 5 |
+| Database | PostgreSQL 17 |
+| Message broker | RabbitMQ 3 (management image) |
+| DB driver | `pg` (connection pooling) |
+| AMQP client | `amqplib` (confirm channels, per-message TTL, dead-letter exchanges) |
+| Config | `dotenv` |
+| Orchestration | Docker Compose — 8 containers |
+| Tests | Bash + curl + psql assertions (`scripts/`) |
+| Logging | Structured JSON to stdout, correlation ID on every line |
+
+### Services
+
+| Service | Host port | Responsibility |
+|---|---|---|
+| `api` | 3000 | Checkout, workflow/payment queries, admin, health, metrics |
+| `orchestrator` | 9101 | Saga state machine + recovery jobs |
+| `inventory-service` | 9102 | Reserve and release stock |
+| `payment-worker` | 9103 | Talks to the external provider |
+| `notification-service` | 9104 | Sends the receipt |
+| `mock-provider` | 4000 | Fake card processor with injectable behaviour |
+| `postgres` | 5442 | All state |
+| `rabbitmq` | 5673 / 15673 | Broker + management UI |
+
+All six application services run the same image with a different entrypoint, so any one of them can be killed mid-saga to observe recovery. Host ports for Postgres and RabbitMQ are offset so the stack runs alongside other local projects.
+
+---
 
 ## Getting Started
 
 ### Prerequisites
 
-The remote machine needs only:
+- **Docker Desktop** (or Docker Engine + Compose v2)
+- **bash**, **curl** — for the test scripts
+- **jq** — for readable output in the examples (`brew install jq`)
+- Node.js 22+ only if you intend to run a service outside Docker
 
-- Docker Engine 20.10+
-- Docker Compose v2 (`docker compose`, bundled with modern Docker)
-- Open inbound ports: `80` (Nginx), and optionally `3000`, `5433`, `6379`, `5672`, `15672` if you want to reach the individual services directly
-
-No Node.js or database installation is required on the host — everything runs in containers.
-
-### Deploy
+### Run it locally
 
 ```bash
-# 1. Clone onto the remote machine
 git clone <repo-url>
-cd notes-app
+cd payment-system
 
-# 2. Build and start the full stack in the background
+cp .env.example .env          # local defaults, no real credentials
+
 docker compose up -d --build
+docker compose ps             # wait for postgres and rabbitmq to report healthy
 
-# 3. Watch the logs until the app reports it is listening
-docker compose logs -f app
+curl -s localhost:3000/ready | jq
+# -> { "ready": true, "checks": { "postgres": true, "rabbitmq": true } }
 ```
 
-Expect to see `Connected to Redis`, `Connected to RabbitMQ`, `SMS worker listening on notes-queue...` and `Server is running on port 3000`.
+Run the full suite of failure scenarios:
 
-### What comes up
+## Architecture
 
-| Container        | Service   | Host port | Notes                                                    |
-|------------------|-----------|-----------|----------------------------------------------------------|
-| `notes_nginx`    | Nginx     | `80`      | Public entry point, proxies to the app                   |
-| `notes_app`      | API       | `3000`    | Express server plus the inline SMS worker                |
-| `notes_postgres` | Postgres  | `5433`    | Published on 5433 to avoid clashing with a native Postgres |
-| `notes_redis`    | Redis     | `6379`    | Sessions and note cache                                  |
-| `boot_rabbitmq`  | RabbitMQ  | `5672`, `15672` | `15672` serves the management UI                   |
-
-Database tables are created automatically on first boot by the SQL in `init-scripts/`, which Postgres runs as an entrypoint script against the empty data volume.
-
-### Configuration
-
-All runtime configuration is supplied as environment variables in `docker-compose.yml` (database host/credentials, Redis host, RabbitMQ URL, `PORT`, `INLINE_WORKER`). Change them there before deploying to a real environment — the committed values are development defaults and must not be used in production. Running outside Compose reads the same variables from a local `.env`, which is gitignored and should never be committed.
-
-### Stopping and resetting
-
-```bash
-docker compose down            # stop, keep data volumes
-docker compose down -v         # stop and wipe Postgres/Redis/RabbitMQ data
-docker compose restart app     # restart just the API after a config change
-```
-
-### Worker topology
-
-`server.js` starts the RabbitMQ consumer inside the API process when `INLINE_WORKER` is not set to `false`. That is convenient for single-node deployments. To scale the worker separately, set `INLINE_WORKER=false` on the app service and run the dedicated worker entrypoint (`npm run worker:sms`) as its own container or process — otherwise the same message is consumed twice.
-
-## Architecture Overview
+Nothing publishes to RabbitMQ directly. Every outgoing message is first written to a database table **in the same transaction as the business change that caused it**, and a relay publishes it afterwards. Every consumer writes its reply back to that same table. The system is therefore a ring, and every hop passes through Postgres.
 
 ```
-                  ┌──────────┐
-   Client ───────▶│  Nginx   │ :80
-                  └────┬─────┘
-                       │ proxy_pass
-                       ▼
-                 ┌───────────┐        ┌────────────┐
-                 │  Express  │───────▶│ PostgreSQL │  users, notes
-                 │   API     │        └────────────┘
-                 │  :3000    │
-                 │           │        ┌────────────┐
-                 │           │───────▶│   Redis    │  session tokens, note cache
-                 │           │        └────────────┘
-                 │           │        ┌────────────────────────────┐
-                 │           │───────▶│ RabbitMQ                   │
-                 └───────────┘        │  notification-events (topic)│
-                       ▲              │    └─▶ notes-queue          │
-                       │              │          └─▶ dlx-exchange   │
-                 ┌───────────┐        │                └─▶ notes-dlq│
-                 │ SMS Worker│◀───────│                            │
-                 │ (inline)  │        └────────────────────────────┘
-                 └───────────┘
+  [ Client ]
+      │ POST /checkout
+      ▼
+  ( api ) ──── workflow + first command, ONE transaction ───► ▤ outbox_events
+                                                                   │
+                                                          claim PENDING (SKIP LOCKED)
+                                                                   ▼
+                                                            ( outbox relay )
+                                                                   │ publish + confirm
+                                                                   ▼
+                                                            ▤ RabbitMQ queues
+                                                                   │ deliver
+            ┌──────────────────┬──────────────────┬───────────────┴──────────┐
+            ▼                  ▼                  ▼                          ▼
+    ( inventory )        ( payment worker )  ( notification )         ( orchestrator )
+            │                  │                  │                          │
+            │                  ▼                  │                 reads current state,
+            │          [ Payment Provider ]       │                 decides next command
+            │                  │                  │                          │
+            └──────────────────┴──────────────────┴──────────────────────────┘
+                                       │
+                       outcome events and next commands
+                                       ▼
+                               ▤ outbox_events  ── back to the relay (ring closes)
 ```
 
-## Authentication Model
+The saga has four business steps — reserve inventory, charge the card, send the receipt, complete — and each one rides the same four mechanical steps: commit with an outbox row, relay publishes, consumer handles, consumer writes its reply to the outbox.
 
-All `/api/notes` routes and `/api/health` sit behind `authGuard`. The guard reads the `Authorization` header (with or without a `Bearer ` prefix), looks the token up in Redis, and attaches the decoded user context to the request. Sessions are opaque random tokens stored in Redis with a one-hour expiry — there is no JWT and no refresh flow. A missing header is a `400`; a token that is absent or expired in Redis is a `401`.
+### Workflow state machine
 
-Every note query is scoped to the authenticated user, so one user can never read or mutate another user's notes — a note belonging to someone else surfaces as `404`, not `403`.
+```
+                         RESERVING_INVENTORY
+                          │                │
+        INVENTORY_FAILED  │                │ INVENTORY_RESERVED
+                          ▼                ▼
+                      FAILED ✗      PROCESSING_PAYMENT
+                                     │      │      │
+                  PAYMENT_FAILED ────┘      │      └──── PAYMENT_UNKNOWN
+                          │                 │                    │
+                          ▼   PAYMENT_SUCCEEDED                  ▼
+              COMPENSATING_INVENTORY │            AWAITING_RECONCILIATION
+                    │        │       │                  │           │
+   INVENTORY_       │        │       ▼          was charged      never charged
+   RELEASED         │        │  SENDING_NOTIFICATION  │              │
+        ▼           │        │       │                │              │
+   COMPENSATED ✗    │        │       ▼  NOTIFICATION_SENT            │
+                    │        └──►  COMPLETED ✗ ◄──────┘              │
+     release exhausted                                               │
+                    ▼                                                │
+        COMPENSATION_FAILED ✗ ◄──────────────────────────────────────┘
+                                                          (compensate instead)
+
+   ✗ = terminal state
+```
+
+Three failure boundaries, three deliberately different answers. Inventory fails and nothing has happened yet, so the saga simply fails. Payment declines and stock is held but no money moved, so compensate. The payment outcome is **unknown** and money may have moved, so do neither — go and ask.
+
+---
 
 ## API Reference
 
-Base path: `/api`. Through Nginx the public base URL is `http://<host>/api`.
+Base URL `http://localhost:3000` unless stated otherwise.
+
+### POST /checkout
+
+**Purpose:** Start a checkout saga. Returns immediately with a correlation ID; all downstream work happens asynchronously.
+
+**Business logic**
+
+1. **Idempotency claim** — The key is inserted with a conflict guard. If the row already exists, the request is a duplicate: a completed key replays its stored response, an in-flight key returns `409`, and a key reused with a *different* request body returns `422` rather than a confidently wrong replay.
+3. **Correlation ID** — Taken from the request header if supplied, otherwise generated. This single value threads through every service, log line, database row and the provider's idempotency key.
+4. **Saga creation** — In **one transaction**: the workflow row is created, the first command is written to the outbox, and the opening transition is recorded. No broker call happens inside the request.
+5. **Response** — `202 Accepted` with the workflow ID, correlation ID and a poll URL. The response is stored against the idempotency key before returning.
+
+**Error paths**
+
+- `400` — missing `Idempotency-Key`, or missing/invalid body fields
+- `409` — a request with this key is currently in flight
+- `422` — this key was already used with a different request body
+- `500` — persistence failure; the key is released so a retry can succeed
+
+**Why the broker is never called here:** if the workflow committed and the publish then failed, the order would exist with nothing to move it forward. Writing the message as a database row in the same transaction removes that gap entirely — the relay retries until the broker confirms.
 
 ---
 
-### POST /api/register
+### POST /charge — mock provider (port 4000)
 
-**Purpose:** Create a user account and fire an asynchronous welcome notification.
+**Purpose:** Stand in for an external card processor, including the behaviours that make payments hard.
 
-**Business Logic:**
+**Behaviour selection.** Either the order ID carries a trigger word, or a runtime override is set through `POST /admin/behavior` — so failure injection needs no restart.
 
-1. **Input validation** — Requires `username` and `password` in the body. Returns `400` if either is missing.
-2. **Password hashing** — Hashes the password with bcrypt at 10 salt rounds. The plaintext is never stored.
-3. **Account creation** — Writes a new user record and returns only the identifier and username; the hash is not returned to the client.
-4. **Event publication** — Publishes a welcome SMS event to the `notification-events` topic exchange with a per-user routing key, a correlation id for tracing, and `persistent: true` so the message survives a broker restart. Publishing happens inside a try/catch: a broker failure is logged but does not fail registration.
-5. **Backpressure handling** — If the channel's write buffer is full, the publish returns `false`; the message is still buffered locally but the condition is logged as broker backpressure.
-6. **Response** — Returns `201` with the created user.
+**Business logic**
 
-**Error paths:**
-- `400` — Missing `username` or `password`
-- `500` — Database failure (a duplicate username currently surfaces here)
-
-### POST /api/login
-
-**Purpose:** Exchange credentials for an opaque session token.
-
-**Business Logic:**
-
-1. **Input validation** — Requires `username` and `password`. Returns `400` otherwise.
-2. **User lookup** — Reads the user record by username. Returns `401` if no account matches.
-3. **Password verification** — Compares the supplied password against the stored bcrypt hash. Returns `401` on mismatch.
-4. **Session creation** — Generates a 16-byte random hex token and stores the user context against it in Redis with a one-hour TTL.
-5. **Response** — Returns `200` with the token. The client sends it back as the `Authorization` header on every protected route.
-
-**Error paths:**
-- `400` — Missing credentials
-- `401` — Unknown user or wrong password
-- `500` — Database or Redis failure
-
-### GET /api/notes/:id
-
-**Purpose:** Fetch a single note belonging to the authenticated user, served from cache when possible.
-
-**Business Logic:**
-
-1. **Authentication** — `authGuard` resolves the session token from Redis and attaches the user context.
-2. **Cache lookup** — Checks a Redis key namespaced by user and note id. On a hit, the cached note is returned immediately and the database is never touched.
-3. **Database read** — On a miss, reads the note scoped to both the note id and the owning user.
-4. **Cache population** — If a row was found, caches it for 3600 seconds.
-5. **Response** — Returns `200` with the note, or `404` when the note does not exist or belongs to someone else.
-
-**Error paths:**
-- `400` — Missing `Authorization` header
-- `401` — Session expired or invalid token
-- `404` — Note not found for this user
-- `500` — Database or cache failure
-
-### GET /api/notes
-
-**Purpose:** List all notes owned by the authenticated user.
-
-**Tables Involved:**
-
-**Business Logic:** After `authGuard` resolves the session, the service reads all notes scoped to the user, ordered by creation time descending, and returns them as an array. This route bypasses the cache entirely — only single-note reads are cached.
-
-**Error paths:** `400` missing header · `401` invalid session · `500` database failure.
+1. **Key required** — a request without an idempotency key is rejected with `400`.
+2. **Ledger replay** — a key already present in the ledger returns its original outcome verbatim, whatever the current behaviour mode says. This is what protects a client that retries.
+3. **Injected latency and failure rate** are applied.
+4. **Behaviour branch** — approve, decline, return a transient error, or withhold the response entirely.
+5. **Every decision is logged** with the key and order ID.
 
 ---
 
-### POST /api/notes
+### GET /transactions — mock provider (port 4000)
 
-**Purpose:** Create a note owned by the authenticated user.
+**Purpose:** Let the reconciler discover what actually happened to a charge whose response was lost. This endpoint is the reason an unknown outcome is recoverable at all.
 
+**Business logic**
 
-**Business Logic:** Takes `title` and `description` from the body and writes a new row linked to the authenticated user, with creation and update timestamps set server-side. Returns `201` with the created note. Note that field-level validation is not currently enforced in the service layer — a missing `title` is rejected by the database constraint and surfaces as `500`.
-
-**Error paths:** `400` missing header · `401` invalid session · `500` database failure or constraint violation.
-
----
-
-### PUT /api/notes/:id
-
-**Purpose:** Update a note's title and description.
-
-**Side effects:** Deletes the cached entry for that note so the next read repopulates it from the database.
-
-**Business Logic:** The update is scoped to both note id and user id, so a note belonging to another user matches nothing and returns `404`. On a successful write the corresponding Redis cache key is invalidated. Returns `200` with the updated note.
-
-**Error paths:** `400` missing header · `401` invalid session · `404` note not found for this user · `500` database failure.
+1. Requires an idempotency key as a query parameter, otherwise `400`.
+2. A matching ledger entry returns the outcome and transaction reference.
+3. No entry returns `404` — an **authoritative** statement that no money moved.
 
 ---
 
-### DELETE /api/notes/:id
+### Read and operational endpoints
 
-**Purpose:** Delete a note.
+| Endpoint | Purpose | Tables read |
+|---|---|---|
+| `GET /workflows/:correlationId` | Full saga timeline: current state, the payment, the reservation, and every transition including ones that were *ignored* as duplicates | `workflow_executions`, `saga_step_history`, `payments`, `reservations` |
+| `GET /payments/:id` | A payment and its auditable status history | `payments`, `payment_events` |
+| `GET /payments` | List payments, filterable by status and order; capped page size | `payments` |
+| `GET /admin/stuck` | First query of the incident runbook: non-terminal workflows past a threshold, unpublished outbox rows, and unresolved payments | `workflow_executions`, `outbox_events`, `payments` |
+| `GET /health` | Liveness. Deliberately touches no dependency, so a database blip cannot make Docker kill a healthy container | — |
+| `GET /ready` | Readiness. Verifies Postgres and RabbitMQ are both reachable; `503` when not | — |
+| `GET /metrics` | Prometheus text format, including gauges collected from the database at scrape time | several, counts only |
 
-**Side effects:** Deletes the cached entry for that note.
-
-**Business Logic:** Deletes the note matching both the id and the authenticated user, invalidates its cache key, and returns `200` with a confirmation message. A note that does not exist or is not owned by the caller returns `404`.
-
-**Error paths:** `400` missing header · `401` invalid session · `404` note not found for this user · `500` database failure.
+Every application service exposes `/health`, `/ready` and `/metrics` on its own port (9101–9104), not just the API.
 
 ---
-
-### GET /api/health
-
-**Purpose:** Liveness and dependency check.
-
-**Business Logic:** Requires a valid session (it sits behind `authGuard`). Returns `200` with `status: "UP"`, a timestamp, and the database status, or `503` with `status: "DOWN"` and the error message when the dependency check fails.
-
-## Message Queue Design
-
-Registration publishes to the `notification-events` topic exchange with routing key `notification.sms.<userId>`. The durable `notes-queue` binds the pattern `notification.sms.*` and is declared with a dead-letter exchange, so rejected messages land in `notes-dlq`.
-
-The consumer applies four production patterns:
-
-| Pattern             | Implementation                                                                      |
-|---------------------|-------------------------------------------------------------------------------------|
-| **Fair dispatch**   | `prefetch(1)` — one unacknowledged message per worker at a time                      |
-| **Idempotency**     | Processed message ids tracked in an in-process set; duplicates are acked and skipped |
-| **Retry**           | Failures are republished to the exchange with an incremented `x-retry-count` header, up to 3 attempts |
-| **Dead-lettering**  | Fatal errors (malformed payloads) and exhausted retries are `nack`ed without requeue, routing them to `notes-dlq` |
-
-The idempotency store is in-memory and therefore per-process and non-durable; moving it to Redis is the natural next step before running multiple worker replicas.
-
-## Testing
-
-```bash
-# 1. Register a user. Expect 201 and a JSON body with id and username.
-#    Check `docker compose logs -f app` in another terminal: you should see a
-#    [publish] line followed by a [FAKE SMS] line from the worker.
-curl -s -X POST $HOST/api/register \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"alice","password":"secret123"}'
-
-# 2. Log in and capture the session token.
-TOKEN=$(curl -s -X POST $HOST/api/login \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"alice","password":"secret123"}' \
-  | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
-echo "$TOKEN"
-
-# 3. Health check. Expect 200 with status UP.
-curl -s $HOST/api/health -H "Authorization: Bearer $TOKEN"
-
-# 4. Create a note. Expect 201 with the created note.
-curl -s -X POST $HOST/api/notes \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"title":"First note","description":"hello world"}'
-
-# 5. List notes. Expect an array containing the note above.
-curl -s $HOST/api/notes -H "Authorization: Bearer $TOKEN"
-
-# 6. Fetch one note by id. Run it twice — the second call is a cache hit,
-#    visible as "Cache hit for note ID: 1" in the app logs.
-curl -s $HOST/api/notes/1 -H "Authorization: Bearer $TOKEN"
-curl -s $HOST/api/notes/1 -H "Authorization: Bearer $TOKEN"
-
-# 7. Update the note. Expect 200 with the new values, and the cache entry
-#    is invalidated — a following GET hits the database again.
-curl -s -X PUT $HOST/api/notes/1 \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"title":"Updated title","description":"updated body"}'
-
-# 8. Delete the note. Expect 200 with a confirmation message.
-curl -s -X DELETE $HOST/api/notes/1 -H "Authorization: Bearer $TOKEN"
-
-# 9. Fetch it again. Expect 404.
-curl -s $HOST/api/notes/1 -H "Authorization: Bearer $TOKEN"
-```
-
-### Negative cases worth checking
-
-```bash
-# No Authorization header → 400
-curl -i -s $HOST/api/notes
-
-# Garbage token → 401 Unauthorized: Session expired
-curl -i -s $HOST/api/notes -H "Authorization: Bearer not-a-real-token"
-
-# Wrong password → 401
-curl -i -s -X POST $HOST/api/login \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"alice","password":"wrong"}'
-
-# Missing credentials → 400
-curl -i -s -X POST $HOST/api/login \
-  -H 'Content-Type: application/json' -d '{}'
-
-# Cross-user isolation: register a second user, log in as them, and request
-# the first user's note id. Expect 404, not the note.
-```
-
-### Checking the supporting services
-
-```bash
-docker compose ps                              # all containers healthy?
-docker compose logs -f app                     # API, publisher, and worker output
-docker compose exec redis redis-cli KEYS '*'   # session tokens and cached notes
-docker compose exec postgres psql -U myuser -d notes_db -c '\dt'   # tables created?
-```
-
-The RabbitMQ management UI is available at `http://<host>:15672` using the broker credentials from `docker-compose.yml`. Use it to confirm that `notification-events`, `notes-queue`, `dlx-exchange`, and `notes-dlq` were declared, and to watch messages flow through on registration.
